@@ -1,0 +1,9 @@
+# Runtime dependencies of the careers app.
+#
+# The first three are what careers itself needs. corsheaders is the dev
+# project's, and is listed because careers.kormic.ai will post to this backend
+# from a browser and an origin policy has to exist somewhere.
+Django>=5.0,<5.1
+djangorestframework>=3.14,<4.0
+djangorestframework-simplejwt>=5.3,<6.0
+django-cors-headers>=3.13

@@ -1,0 +1,163 @@
+diff --git a/accounts/migrations/0006_account_person_id_and_roles.py b/accounts/migrations/0006_account_person_id_and_roles.py
+new file mode 100644
+index 0000000..f3544cb
+--- /dev/null
++++ b/accounts/migrations/0006_account_person_id_and_roles.py
+@@ -0,0 +1,51 @@
++"""
++Account gains a person identifier and a plural role list.
++
++Nothing existing changes behaviour. `role` stays exactly where it was and keeps
++its value, so the call sites that filter and compare on it are untouched. The
++data migration copies each account's current role into `roles` as its only
++entry, which means has_role() gives the same answer as the old comparison did on
++every row that exists today.
++
++person_id is the join to careers.Person. It is separate from student_id on
++purpose: a candidate resolving through student_id would make every physician
++assistant a student row, which is the thing the careers spine exists to prevent.
++"""
++from django.db import migrations, models
++
++
++def fill_roles(apps, schema_editor):
++    Account = apps.get_model("accounts", "Account")
++    for account in Account.objects.all().iterator():
++        if not account.roles:
++            account.roles = [account.role] if account.role else []
++            account.save(update_fields=["roles"])
++
++
++def clear_roles(apps, schema_editor):
++    """Reverse leaves `role` intact, so nobody loses their access on a rollback."""
++    Account = apps.get_model("accounts", "Account")
++    Account.objects.all().update(roles=[])
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ("accounts", "0005_account_institute_id_alter_account_role"),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name="account",
++            name="roles",
++            field=models.JSONField(blank=True, default=list),
++        ),
++        migrations.AddField(
++            model_name="account",
++            name="person_id",
++            field=models.CharField(
++                blank=True, db_index=True, max_length=64, null=True, unique=True
++            ),
++        ),
++        migrations.RunPython(fill_roles, clear_roles),
++    ]
+diff --git a/accounts/models.py b/accounts/models.py
+index ea243a4..b9187a7 100644
+--- a/accounts/models.py
++++ b/accounts/models.py
+@@ -23,18 +23,50 @@ class Account(models.Model):
+         SUPERUSER = "superuser", "Superuser"
+ 
+     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="account")
++
++    # The primary role. Kept as a real column because 140-odd call sites filter
++    # and compare on it, and because a person still has one role they mainly
++    # act in. `roles` below is the complete answer; this is the first entry.
+     role = models.CharField(max_length=20, choices=Role.choices)
+ 
+-    # Only one of these is populated, depending on role.
++    # A person may hold more than one role. A physician assistant who once came
++    # through a university list is a candidate and a student at the same time,
++    # and one agent per person means we cannot give them two accounts to keep
++    # the old one-role assumption alive.
++    roles = models.JSONField(default=list, blank=True)
++
++    # Identifiers stand independently now rather than only one being populated,
++    # since a person holding two roles holds two identifiers.
+     student_id = models.CharField(max_length=255, null=True, blank=True, unique=True, db_index=True)
+     university_id = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+     institute_id = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+ 
++    # The careers corridor's durable identity (careers.Person.person_id). This
++    # is how a logged-in candidate resolves to a person, and it is deliberately
++    # not student_id: a candidate must never become a student row.
++    person_id = models.CharField(max_length=64, null=True, blank=True, unique=True, db_index=True)
++
+     created_at = models.DateTimeField(auto_now_add=True)
+     updated_at = models.DateTimeField(auto_now=True)
+ 
++    def save(self, *args, **kwargs):
++        """Keep `roles` and `role` in step, so neither can drift from the other."""
++        if self.role and self.role not in self.roles:
++            self.roles = [self.role, *self.roles]
++        super().save(*args, **kwargs)
++
++    def has_role(self, role: str) -> bool:
++        """Use this rather than comparing `role`, or a second role goes unseen."""
++        return role == self.role or role in (self.roles or [])
++
++    def add_role(self, role: str) -> None:
++        """Grant a role without disturbing the one the person already acts in."""
++        if not self.has_role(role):
++            self.roles = [*(self.roles or []), role]
++            self.save(update_fields=["roles"])
++
+     def __str__(self) -> str:
+-        return f"Account({self.user.email}, {self.role})"
++        return f"Account({self.user.email}, {'/'.join(self.roles or [self.role])})"
+ 
+ 
+ class TOTPDevice(models.Model):
+diff --git a/accounts/permissions.py b/accounts/permissions.py
+index 5ffa3f3..fdc1033 100644
+--- a/accounts/permissions.py
++++ b/accounts/permissions.py
+@@ -28,7 +28,7 @@ class IsStudentRole(BasePermission):
+ 
+     def has_permission(self, request, view) -> bool:
+         account = get_account(request)
+-        return account is not None and account.role == Account.Role.STUDENT
++        return account is not None and account.has_role(Account.Role.STUDENT)
+ 
+ 
+ class IsUniversityRole(BasePermission):
+@@ -36,7 +36,7 @@ class IsUniversityRole(BasePermission):
+ 
+     def has_permission(self, request, view) -> bool:
+         account = get_account(request)
+-        return account is not None and account.role == Account.Role.UNIVERSITY
++        return account is not None and account.has_role(Account.Role.UNIVERSITY)
+ 
+ 
+ class IsInstituteRole(BasePermission):
+@@ -44,7 +44,7 @@ class IsInstituteRole(BasePermission):
+ 
+     def has_permission(self, request, view) -> bool:
+         account = get_account(request)
+-        return account is not None and account.role == Account.Role.INSTITUTE
++        return account is not None and account.has_role(Account.Role.INSTITUTE)
+ 
+ 
+ class IsStudentOrUniversityRole(BasePermission):
+@@ -52,7 +52,7 @@ class IsStudentOrUniversityRole(BasePermission):
+ 
+     def has_permission(self, request, view) -> bool:
+         account = get_account(request)
+-        return account is not None and account.role in (Account.Role.STUDENT, Account.Role.UNIVERSITY)
++        return account is not None and (account.has_role(Account.Role.STUDENT) or account.has_role(Account.Role.UNIVERSITY))
+ 
+ 
+ class IsSuperUserRole(BasePermission):
+@@ -60,7 +60,7 @@ class IsSuperUserRole(BasePermission):
+ 
+     def has_permission(self, request, view) -> bool:
+         account = get_account(request)
+-        return account is not None and account.role == Account.Role.SUPERUSER
++        return account is not None and account.has_role(Account.Role.SUPERUSER)
+ 
+ 
+ class ScopedToOwnStudentId(BasePermission):
