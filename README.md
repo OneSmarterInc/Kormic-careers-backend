@@ -135,6 +135,49 @@ says why.
 
 ---
 
+## Background checks (OIG and SAM.gov)
+
+Exclusion screens run automatically. They are rungs with `input: "automatic"`:
+the person types nothing, the app shows them under **Background checks** on the
+profile instead of as steps, and they never count towards "checked".
+
+**When they run:** once a person has a name and a date of birth, and again
+whenever either (or their previous names) changes. A rung submission also runs
+any check that has never run for that person. Saving the same details again
+does not re-run anything, because SAM.gov's free key allows 10 calls a day.
+
+**What the person sees:** `no_match` is shown with the list's date and what was
+searched on. `possible_match` and `match` reach the person only as
+`under_review`; the real outcome stays in the claims table for a reviewer.
+
+### The OIG list
+
+```bash
+python manage.py fetch_leie              # download if OIG has a newer file
+python manage.py fetch_leie --rescreen   # ...and re-screen everyone against it
+```
+
+Saved in `data/leie/` (gitignored). The publication date comes from OIG's own
+`Last-Modified` header, or `--as-of YYYY-MM-DD`. A download with fewer than
+10,000 records is refused and the current list stays in place. The three most
+recent months are kept.
+
+After the **first** download, restart the server once to switch OIG screening
+on. Later months are picked up without a restart.
+
+Run it monthly. Windows Task Scheduler:
+
+```powershell
+schtasks /Create /SC MONTHLY /D 15 /TN "Kormic LEIE" /TR "cmd /c cd /d C:\path	o\kormic-careers-backend && python manage.py fetch_leie --rescreen"
+```
+
+or cron: `0 6 15 * * cd /path/to/kormic-careers-backend && python manage.py fetch_leie --rescreen`
+
+### SAM.gov
+
+Set `SAM_API_KEY` in this project's `.env`. Without it the `sam` rung stays
+unwired and shows "Not run yet".
+
 ## Configuration
 
 Nothing is hardcoded. See `.env.example`.

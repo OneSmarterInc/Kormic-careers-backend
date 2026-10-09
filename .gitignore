@@ -6,3 +6,6 @@ __pycache__/
 venv/
 staticfiles/
 .pytest_cache/
+
+# The monthly OIG exclusion list. Public data, 15MB, replaced monthly.
+data/

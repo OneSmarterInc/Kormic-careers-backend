@@ -21,7 +21,7 @@ urlpatterns = [
     path("agent/history/", views.chat_history, name="stub-chat-history"),
     path("agent/message/", views.chat_send, name="stub-chat-send"),
     path("agent/name/", views.chat_rename, name="stub-chat-rename"),
-    # Not yet served anywhere. Shapes are the client's.
-    path("claims/<str:rung_key>/document/", views.rung_document, name="stub-rung-document"),
+    # The document route moved into careers, which now hands the upload to the
+    # rung's bot rather than hashing it and dropping it.
     path("notifications/register/", views.push_register, name="stub-push-register"),
 ]

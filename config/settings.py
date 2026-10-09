@@ -18,10 +18,37 @@ repeated, so this file is a worked example of each:
     same as having no origin policy at all.
 """
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_env_file() -> None:
+    """
+    Read `.env` beside manage.py, without overriding anything already exported.
+
+    DEV SCAFFOLD, like the rest of this file. It exists because the alternative
+    is exporting a handful of variables by hand in every new shell, and the
+    syntax for that differs between PowerShell and Git Bash — which is a real
+    source of "it works in one terminal and not the other".
+
+    `setdefault`, never overwrite: a deployment that exports its own values
+    keeps them, so this can never quietly beat a real environment.
+    """
+    path = BASE_DIR / ".env"
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+_load_env_file()
 
 
 def _flag(name: str, default: bool = False) -> bool:
@@ -152,6 +179,61 @@ SIMPLE_JWT = {
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
 
+# --- Agents ---------------------------------------------------------------
+
+# DEV ONLY. The helper bots live in the main project, and careers imports them
+# lazily by name so a deployment without them still works. This puts that
+# checkout on the path so they can be exercised here.
+#
+# In the real project careers sits alongside `agents` already and none of this
+# is needed.
+AGENTS_PATH = os.environ.get(
+    "KORMIC_AGENTS_PATH", str(BASE_DIR.parent / "kormic-Django-Backend-Prajval-1")
+)
+# Appended, never prepended. That checkout also contains a `django_api` and an
+# `accounts`, and putting it first shadows the stubs this project runs on —
+# Django then tries to load the real models and their whole dependency tree.
+# At the end of the path, only names this project does not already have
+# resolve there, which is exactly `agents`.
+if DEBUG and os.path.isdir(os.path.join(AGENTS_PATH, "agents")):
+    sys.path.append(AGENTS_PATH)
+
+# The shared agents package. Preferred over the in-repo adapter above, which
+# wraps a resume parser written for graduate admissions — on a nurse's CV it
+# goes looking for a GRE score.
+#
+# Appended for the same reason, and installed with `pip install -e` in a real
+# deployment. This is the local-checkout convenience only.
+KORMIC_AGENTS_PATH = os.environ.get(
+    "KORMIC_AGENTS_PATH", str(BASE_DIR.parent / "kormic-agents")
+)
+if os.path.isdir(os.path.join(KORMIC_AGENTS_PATH, "kormic_agents")):
+    sys.path.append(KORMIC_AGENTS_PATH)
+
+# --- Logging --------------------------------------------------------------
+
+# Django only configures its own `django` logger, so an app logger at INFO
+# propagates to a root logger with no handler and is dropped. That silently
+# swallowed the signup code, which `signup_start` logs in DEBUG precisely so
+# the ladder can be walked locally without an email backend.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"plain": {"format": "{levelname} {name}: {message}", "style": "{"}},
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "plain"},
+    },
+    "loggers": {
+        "careers": {
+            "handlers": ["console"],
+            # INFO in development only. The code is not something to write into
+            # a production log, and DEBUG being off is what stops it.
+            "level": "INFO" if DEBUG else "WARNING",
+            "propagate": False,
+        },
+    },
+}
+
 # --- CORS -----------------------------------------------------------------
 
 # Named origins, never a wildcard. Expo web serves on 8081 in development.
@@ -169,3 +251,18 @@ if not DEBUG:
     SECURE_HSTS_SECONDS = 60 * 60 * 24 * 365
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+
+# Which model careers resolves a logged-in user to a person through. The dev
+# project uses the devauth stub; the real project sets this to accounts.Account.
+CAREERS_ACCOUNT_MODEL = "devauth.Account"
+
+
+# --- OIG exclusion list (LEIE) ---------------------------------------------
+# Where `manage.py fetch_leie` keeps the monthly download, and where the `oig`
+# screening agent reads it. Not committed: it is 15MB of public data that is
+# replaced every month.
+LEIE_DIR = Path(os.environ.get("LEIE_DIR", BASE_DIR / "data" / "leie"))
+LEIE_URL = os.environ.get(
+    "LEIE_URL", "https://oig.hhs.gov/exclusions/downloadables/UPDATED.csv"
+)

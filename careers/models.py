@@ -38,7 +38,13 @@ class Person(models.Model):
 
     # The person's own agent. Named on first use and person-editable after,
     # which is the ownership cue. Called a Navigator in public copy.
-    agent_name = models.CharField(max_length=100, unique=True, null=True, blank=True, db_index=True)
+    #
+    # Not unique. It is what this person calls their own agent, not a handle
+    # anyone else addresses them by, so two people both naming theirs Ada is
+    # ordinary rather than a collision. It was unique, and the second person to
+    # pick a taken word got an IntegrityError on a rename that should never
+    # have been able to fail.
+    agent_name = models.CharField(max_length=100, null=True, blank=True, db_index=True)
 
     full_name = models.CharField(max_length=255, blank=True, default="")
     email = models.CharField(max_length=255, blank=True, default="", db_index=True)
@@ -46,6 +52,30 @@ class Person(models.Model):
     city = models.CharField(max_length=255, blank=True, default="")
     region = models.CharField(max_length=255, blank=True, default="")
     country = models.CharField(max_length=255, blank=True, default="")
+
+    # --- identity resolution, for screening only --------------------------
+    # Both exist for one reason: telling this person apart from somebody with
+    # the same name on a federal exclusion list. Neither is used to identify
+    # them anywhere else, and neither is required to use the product.
+    #
+    # A date of birth is what turns "somebody called Amara Okafor is excluded"
+    # into an answer. 99% of rows on the OIG list carry one, so without it
+    # almost every name collision becomes manual review; with it, most resolve
+    # on their own. It is also the field that *clears* people — a shared name
+    # with a different date of birth is a different person, and saying so is
+    # the single most valuable thing this column does.
+    date_of_birth = models.DateField(null=True, blank=True)
+
+    # Exclusions are recorded under the name held at the time. Screening only
+    # the current name misses exactly the people worth finding, and in a
+    # profession that is overwhelmingly women a marriage change is ordinary.
+    previous_names = models.JSONField(default=list, blank=True)
+
+    # When the person agreed to be screened against the federal exclusion
+    # lists. Null means they have not, and no background check runs without
+    # it. Set by the server at the moment they agree — never taken from the
+    # client — so the timestamp is evidence of when consent was given.
+    screening_consent_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -97,12 +127,38 @@ class CorridorRung(models.Model):
         OPTIONAL = "optional", "Optional"
         NOT_APPLICABLE = "not_applicable", "Not applicable"
 
+    class Route(models.TextChoices):
+        """
+        Whether reaching this rung's authority costs money.
+
+        FREE routes run on their own when a person joins, because there is no
+        decision to make about spending nothing. PAID routes wait until a
+        hiring human ticks that person, since anything that costs money is the
+        client's decision. NONE means no programmatic route to the authority
+        exists at all, so the claim stays where the person left it however much
+        anyone would like to spend.
+
+        This is set by a human per corridor and never inferred. Which
+        authorities have a free route, a paid one, or none is research with a
+        defined end, and until it is done a rung's route is unset rather than
+        guessed at.
+        """
+
+        FREE = "free", "Free"
+        PAID = "paid", "Paid"
+        NONE = "none", "No route"
+
     class Input(models.TextChoices):
         IDENTIFIER = "identifier", "Identifier"
         IDENTIFIER_WITH_JURISDICTION = "identifier_with_jurisdiction", "Identifier with jurisdiction"
         OAUTH = "oauth", "Third-party login"
         DOCUMENT_UPLOAD = "document_upload", "Document upload"
         SCREENSHOTS = "screenshots", "Screenshots"
+        # Nothing for the person to hand in. The check runs from what we
+        # already hold about them — an exclusion screen on their name and date
+        # of birth — so it is not a step on their ladder and the app shows it
+        # under background checks instead.
+        AUTOMATIC = "automatic", "Automatic"
 
     corridor = models.ForeignKey(Corridor, on_delete=models.CASCADE, related_name="rungs")
     key = models.CharField(max_length=64)
@@ -112,7 +168,32 @@ class CorridorRung(models.Model):
     # Which helper bot services this rung. Null means the person tells us and it
     # is shown to practices that way.
     verifier = models.CharField(max_length=64, blank=True, null=True)
+    # Null until somebody has established what reaching this authority costs.
+    # A null route behaves as none: nothing runs by itself and nothing is
+    # offered for sale, which is the only honest default.
+    route = models.CharField(max_length=10, choices=Route.choices, blank=True, null=True)
+    # Where this credential can be issued, as [{"code": ..., "label": ...}].
+    #
+    # The client renders a picker from this rather than a text box. It has to:
+    # the code is matched against the authority directory, so a person typing
+    # "California" instead of "US-CA" reaches nothing, and the field previously
+    # asked for "the body that issued it" — which no amount of careful typing
+    # could turn into a code the lookup would find.
+    #
+    # Empty means the corridor has not enumerated them, and the client falls
+    # back to free text. That keeps a rung usable before anybody has done the
+    # research, at the cost of the lookup rarely matching — which is the same
+    # honest "not confirmed with anyone" it would reach anyway.
+    jurisdictions = models.JSONField(default=list, blank=True)
     order = models.IntegerField(default=0)
+
+    def jurisdiction_codes(self) -> list:
+        """The codes a submission may name, for validating one server-side."""
+        return [
+            str(entry.get("code", "")).strip()
+            for entry in (self.jurisdictions or [])
+            if isinstance(entry, dict) and str(entry.get("code", "")).strip()
+        ]
 
     class Meta:
         ordering = ["order"]
@@ -142,6 +223,19 @@ class VerificationClaim(models.Model):
         ORG_VOUCHED = "org_vouched", "Vouched by an organisation"
         SELF_ATTESTED = "self_attested", "Self attested"
 
+    class Shape(models.TextChoices):
+        # What kind of statement this row makes. Orthogonal to `method`, which
+        # says how good the source was.
+        #
+        # A screen is the result of searching a list for somebody — an OIG
+        # exclusion check, a SAM.gov debarment check. It is legitimately
+        # `primary_source`, because the list's publisher really was asked, but
+        # "no matching record found" and "this licence is confirmed" are not
+        # the same sentence and must never render as one. Without this column a
+        # screen is stored as an ordinary fact and `headline_claim` crowns it.
+        ASSERTS = "asserts", "A fact about the person"
+        SCREENS = "screens", "The result of searching a list"
+
     class Status(models.TextChoices):
         ACTIVE = "active", "Active"
         EXPIRED = "expired", "Expired"
@@ -164,6 +258,23 @@ class VerificationClaim(models.Model):
     verifier = models.CharField(max_length=64, blank=True, null=True)
     verifier_version = models.CharField(max_length=64, blank=True, null=True)
 
+    shape = models.CharField(max_length=16, choices=Shape.choices, default=Shape.ASSERTS)
+
+    # For a screen: the date of the *data*, which is not the date we looked.
+    # The OIG exclusion list is a monthly file, so a check run today answers a
+    # question about last month. A screen stored without this cannot be
+    # challenged, because nobody can say what it was true of.
+    #
+    # A DateField rather than a DateTimeField, unlike every other date on this
+    # model: a file has a publication date, not a publication instant, and
+    # widening it to a datetime would invent a precision the source never had.
+    source_as_of = models.DateField(null=True, blank=True)
+
+    # For a screen: which identifiers it searched on. The whole difference
+    # between a weak miss and a strong one — "no match on a name" and "no match
+    # on name, date of birth and NPI" are not the same claim.
+    matched_on = models.JSONField(default=list, blank=True)
+
     # Never null. A method without a check date is not a claim, and the client
     # refuses to render one.
     checked_at = models.DateTimeField()
@@ -182,3 +293,49 @@ class VerificationClaim(models.Model):
 
     def __str__(self):
         return f"Claim({self.person_id}:{self.rung_key}, {self.method}, {self.status})"
+
+
+class SignupCode(models.Model):
+    """
+    The open front door. Careers is not an invitation corridor: anyone may join,
+    and the practice pays to hire rather than to gate who exists.
+
+    The code proves control of the address before an account is minted, which is
+    what stops the open door from filling with addresses nobody owns. The
+    discipline is the claim flow's, because the reasoning is the same: the code
+    is hashed at rest so a database read does not hand over live codes, it has a
+    short life, and attempts are capped.
+
+    What it deliberately does not do is tell anyone whether an address is
+    already registered. Start answers identically either way.
+    """
+
+    TTL_MINUTES = 10
+    MAX_ATTEMPTS = 5
+
+    email = models.CharField(max_length=255, db_index=True)
+    code_hash = models.CharField(max_length=64)
+    attempts = models.IntegerField(default=0)
+    expires_at = models.DateTimeField()
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["email", "consumed_at"])]
+
+    @staticmethod
+    def hash_code(code: str) -> str:
+        import hashlib
+
+        return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()
+
+    def is_live(self, now) -> bool:
+        return (
+            self.consumed_at is None
+            and self.attempts < self.MAX_ATTEMPTS
+            and self.expires_at > now
+        )
+
+    def __str__(self):
+        return f"SignupCode({self.email}, attempts={self.attempts})"

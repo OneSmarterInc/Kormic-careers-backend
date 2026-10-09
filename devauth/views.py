@@ -237,10 +237,7 @@ def chat_rename(request):
     person = _person_for(request)
     name = (request.data.get("name") or "").strip()
     if person and name:
-        # Person.agent_name is globally unique, which breaks the moment two
-        # people pick the same word. Suffixed here so the dev server does not
-        # 500 on it — the model is what actually needs changing.
-        person.agent_name = name + "#" + person.person_id[-4:]
+        person.agent_name = name
         person.save(update_fields=["agent_name"])
     return Response(status=status.HTTP_204_NO_CONTENT)
 
